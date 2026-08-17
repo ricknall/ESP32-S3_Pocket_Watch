@@ -1,0 +1,20 @@
+{
+  "name": "GFX Library for Arduino - CO5300 subset",
+  "version": "1.6.4",
+  "description": "Waveshare-bundled GFX library, restricted to the CO5300 QSPI path used by ESP32-S3-Touch-AMOLED-1.75C",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "headers": "Arduino_GFX_Library.h",
+  "build": {
+    "srcFilter": [
+      "+<Arduino_DataBus.cpp>",
+      "+<Arduino_G.cpp>",
+      "+<Arduino_GFX.cpp>",
+      "+<Arduino_TFT.cpp>",
+      "+<Arduino_OLED.cpp>",
+      "+<databus/Arduino_ESP32QSPI.cpp>",
+      "+<display/Arduino_CO5300.cpp>"
+    ]
+  },
+  "license": "Apache-2.0"
+}
