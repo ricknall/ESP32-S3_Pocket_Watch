@@ -13,7 +13,7 @@
 #endif
 
 namespace {
-constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.3.1-test1";
+constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.3.1";
 constexpr char CENTRAL_TIME_RULE[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 constexpr uint8_t CST9217_ADDRESS = 0x5A;
 constexpr uint8_t CST_ACK = 0xAB;
