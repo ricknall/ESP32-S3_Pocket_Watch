@@ -13,7 +13,7 @@
 #endif
 
 namespace {
-constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.3.0";
+constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.3.1-test1";
 constexpr char CENTRAL_TIME_RULE[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 constexpr uint8_t CST9217_ADDRESS = 0x5A;
 constexpr uint8_t CST_ACK = 0xAB;
@@ -46,6 +46,11 @@ bool clockSynced = false;
 bool use24Hour = false;
 volatile bool touchInterruptPending = false;
 uint32_t lastClockSecond = UINT32_MAX;
+int lastRenderedHour = -1;
+int lastRenderedMinute = -1;
+int lastRenderedYearDay = -1;
+bool lastRenderedUse24Hour = false;
+char lastRenderedZone[8]{};
 uint32_t lastAcceptedTouchMs = 0;
 TouchSample lastAcceptedTouch{};
 
@@ -59,12 +64,17 @@ bool credentialsConfigured() {
          strcmp(WATCH_WIFI_PASSWORD, "YOUR_WIFI_PASSWORD") != 0;
 }
 
-void drawCentered(const char *text, int16_t y, uint8_t size, uint16_t color) {
+void drawCentered(const char *text, int16_t y, uint8_t size, uint16_t color,
+                  bool opaque = false) {
   if (!displayReady) return;
   const int16_t width = static_cast<int16_t>(strlen(text) * 6 * size);
   const int16_t centeredX = (BoardPins::LCD_WIDTH - width) / 2;
   display->setTextSize(size);
-  display->setTextColor(color);
+  if (opaque) {
+    display->setTextColor(color, RGB565_BLACK);
+  } else {
+    display->setTextColor(color);
+  }
   display->setCursor(centeredX > 0 ? centeredX : 0, y);
   display->print(text);
 }
@@ -104,9 +114,12 @@ void drawClock(bool force = false) {
   if (!force && second == lastClockSecond) return;
   lastClockSecond = second;
 
-  display->fillRect(55, 90, 356, 257, RGB565_BLACK);
-
   if (!valid) {
+    display->fillRect(55, 90, 356, 257, RGB565_BLACK);
+    lastRenderedHour = -1;
+    lastRenderedMinute = -1;
+    lastRenderedYearDay = -1;
+    lastRenderedZone[0] = '\0';
     drawCentered("--:--", 142, 7, RGB565_WHITE);
     drawCentered("WAITING FOR NTP", 270, 2, RGB565_YELLOW);
     return;
@@ -123,7 +136,16 @@ void drawClock(bool force = false) {
   char timeText[8];
   snprintf(timeText, sizeof(timeText), use24Hour ? "%02d:%02d" : "%d:%02d",
            hour, local.tm_min);
-  drawCentered(timeText, 130, 7, RGB565_WHITE);
+
+  const bool modeChanged = use24Hour != lastRenderedUse24Hour;
+  const bool minuteChanged = local.tm_hour != lastRenderedHour ||
+                             local.tm_min != lastRenderedMinute;
+  if (force || modeChanged || minuteChanged) {
+    display->fillRect(55, 125, 356, 76, RGB565_BLACK);
+    drawCentered(timeText, 130, 7, RGB565_WHITE);
+    lastRenderedHour = local.tm_hour;
+    lastRenderedMinute = local.tm_min;
+  }
 
   char secondsText[16];
   if (use24Hour) {
@@ -132,22 +154,35 @@ void drawClock(bool force = false) {
     snprintf(secondsText, sizeof(secondsText), "%s  :%02d", meridiem,
              local.tm_sec);
   }
-  drawCentered(secondsText, 207, 3, RGB565_GREEN);
+  if (force || modeChanged) {
+    display->fillRect(55, 202, 356, 34, RGB565_BLACK);
+  }
+  drawCentered(secondsText, 207, 3, RGB565_GREEN, true);
 
-  char weekday[16];
-  strftime(weekday, sizeof(weekday), "%A", &local);
-  drawCentered(weekday, 269, 3, RGB565_CYAN);
+  if (force || local.tm_yday != lastRenderedYearDay) {
+    display->fillRect(55, 263, 356, 71, RGB565_BLACK);
 
-  char dateText[24];
-  strftime(dateText, sizeof(dateText), "%b %d, %Y", &local);
-  drawCentered(dateText, 310, 2, RGB565_LIGHTGREY);
+    char weekday[16];
+    strftime(weekday, sizeof(weekday), "%A", &local);
+    drawCentered(weekday, 269, 3, RGB565_CYAN);
+
+    char dateText[24];
+    strftime(dateText, sizeof(dateText), "%b %d, %Y", &local);
+    drawCentered(dateText, 310, 2, RGB565_LIGHTGREY);
+    lastRenderedYearDay = local.tm_yday;
+  }
 
   char zone[8];
   strftime(zone, sizeof(zone), "%Z", &local);
-  char status[40];
-  snprintf(status, sizeof(status), "NTP SYNCED  %s", zone);
-  drawStatus(status, use24Hour ? "TAP: 12-HOUR" : "TAP: 24-HOUR",
-             RGB565_GREEN);
+  if (force || modeChanged || strcmp(zone, lastRenderedZone) != 0) {
+    char status[40];
+    snprintf(status, sizeof(status), "NTP SYNCED  %s", zone);
+    drawStatus(status, use24Hour ? "TAP: 12-HOUR" : "TAP: 24-HOUR",
+               RGB565_GREEN);
+    snprintf(lastRenderedZone, sizeof(lastRenderedZone), "%s", zone);
+  }
+
+  lastRenderedUse24Hour = use24Hour;
 }
 
 bool pingAddress(uint8_t address) {
