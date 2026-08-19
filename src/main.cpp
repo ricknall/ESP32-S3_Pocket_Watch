@@ -13,15 +13,27 @@
 #endif
 
 namespace {
-constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.3.1";
+constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.4.0";
 constexpr char CENTRAL_TIME_RULE[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 constexpr uint8_t CST9217_ADDRESS = 0x5A;
 constexpr uint8_t CST_ACK = 0xAB;
+constexpr uint8_t AXP2101_ADDRESS = 0x34;
+constexpr uint8_t AXP2101_EXPECTED_CHIP_ID = 0x4A;
+constexpr uint8_t AXP2101_STATUS1 = 0x00;
+constexpr uint8_t AXP2101_STATUS2 = 0x01;
+constexpr uint8_t AXP2101_CHIP_ID = 0x03;
+constexpr uint8_t AXP2101_ADC_CONTROL = 0x30;
+constexpr uint8_t AXP2101_BATTERY_VOLTAGE_HIGH = 0x34;
+constexpr uint8_t AXP2101_USB_VOLTAGE_HIGH = 0x38;
+constexpr uint8_t AXP2101_SYSTEM_VOLTAGE_HIGH = 0x3A;
+constexpr uint8_t AXP2101_BATTERY_DETECTION = 0x68;
+constexpr uint8_t AXP2101_BATTERY_PERCENT = 0xA4;
 constexpr uint16_t SCREEN_MAX = BoardPins::LCD_WIDTH - 1;
 constexpr uint32_t WIFI_TIMEOUT_MS = 15000;
 constexpr uint32_t NTP_TIMEOUT_MS = 15000;
 constexpr uint32_t TOUCH_DEBOUNCE_MS = 120;
 constexpr uint32_t TOUCH_REPEAT_MS = 600;
+constexpr uint32_t POWER_SAMPLE_INTERVAL_MS = 5000;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     BoardPins::LCD_CS, BoardPins::LCD_SCLK,
@@ -40,10 +52,27 @@ struct TouchSample {
   uint16_t screenY = 0;
 };
 
+struct PowerSample {
+  bool valid = false;
+  bool batteryConnected = false;
+  bool usbPresent = false;
+  bool charging = false;
+  bool discharging = false;
+  uint8_t rawStatus1 = 0;
+  uint8_t rawStatus2 = 0;
+  uint8_t chargeStage = 0;
+  uint16_t batteryMillivolts = 0;
+  uint16_t usbMillivolts = 0;
+  uint16_t systemMillivolts = 0;
+  int batteryPercent = -1;
+};
+
 bool displayReady = false;
 bool touchReady = false;
+bool powerReady = false;
 bool clockSynced = false;
 bool use24Hour = false;
+bool powerDisplayDirty = false;
 volatile bool touchInterruptPending = false;
 uint32_t lastClockSecond = UINT32_MAX;
 int lastRenderedHour = -1;
@@ -52,7 +81,9 @@ int lastRenderedYearDay = -1;
 bool lastRenderedUse24Hour = false;
 char lastRenderedZone[8]{};
 uint32_t lastAcceptedTouchMs = 0;
+uint32_t lastPowerSampleMs = 0;
 TouchSample lastAcceptedTouch{};
+PowerSample powerSample{};
 
 void IRAM_ATTR onTouchInterrupt() {
   touchInterruptPending = true;
@@ -111,7 +142,7 @@ void drawClock(bool force = false) {
   tm local{};
   const bool valid = currentLocalTime(local);
   const uint32_t second = valid ? static_cast<uint32_t>(local.tm_sec) : 60;
-  if (!force && second == lastClockSecond) return;
+  if (!force && second == lastClockSecond && !powerDisplayDirty) return;
   lastClockSecond = second;
 
   if (!valid) {
@@ -120,6 +151,7 @@ void drawClock(bool force = false) {
     lastRenderedMinute = -1;
     lastRenderedYearDay = -1;
     lastRenderedZone[0] = '\0';
+    powerDisplayDirty = false;
     drawCentered("--:--", 142, 7, RGB565_WHITE);
     drawCentered("WAITING FOR NTP", 270, 2, RGB565_YELLOW);
     return;
@@ -174,12 +206,45 @@ void drawClock(bool force = false) {
 
   char zone[8];
   strftime(zone, sizeof(zone), "%Z", &local);
-  if (force || modeChanged || strcmp(zone, lastRenderedZone) != 0) {
-    char status[40];
-    snprintf(status, sizeof(status), "NTP SYNCED  %s", zone);
-    drawStatus(status, use24Hour ? "TAP: 12-HOUR" : "TAP: 24-HOUR",
-               RGB565_GREEN);
+  if (force || modeChanged || powerDisplayDirty ||
+      strcmp(zone, lastRenderedZone) != 0) {
+    if (powerReady && powerSample.valid) {
+      char batteryLine[40];
+      if (!powerSample.batteryConnected) {
+        snprintf(batteryLine, sizeof(batteryLine),
+                 "%s  NO BATTERY", powerSample.usbPresent ? "USB" : "PMU");
+      } else if (powerSample.batteryPercent >= 0) {
+        snprintf(batteryLine, sizeof(batteryLine), "BAT %d%%  %u.%02uV  %s",
+                 powerSample.batteryPercent,
+                 powerSample.batteryMillivolts / 1000,
+                 (powerSample.batteryMillivolts % 1000) / 10,
+                 powerSample.charging ? "CHG" :
+                     (powerSample.usbPresent ? "USB" : "BAT"));
+      } else {
+        snprintf(batteryLine, sizeof(batteryLine), "BAT %u.%02uV  %s",
+                 powerSample.batteryMillivolts / 1000,
+                 (powerSample.batteryMillivolts % 1000) / 10,
+                 powerSample.charging ? "CHG" :
+                     (powerSample.usbPresent ? "USB" : "BAT"));
+      }
+
+      char hintLine[40];
+      snprintf(hintLine, sizeof(hintLine), "%s  TAP: %s", zone,
+               use24Hour ? "12-HOUR" : "24-HOUR");
+      const uint16_t batteryColor =
+          powerSample.batteryConnected && powerSample.batteryPercent >= 0 &&
+                  powerSample.batteryPercent <= 15
+              ? RGB565_RED
+              : (powerSample.charging ? RGB565_CYAN : RGB565_GREEN);
+      drawStatus(batteryLine, hintLine, batteryColor);
+    } else {
+      char status[40];
+      snprintf(status, sizeof(status), "NTP SYNCED  %s", zone);
+      drawStatus(status, use24Hour ? "TAP: 12-HOUR" : "TAP: 24-HOUR",
+                 RGB565_GREEN);
+    }
     snprintf(lastRenderedZone, sizeof(lastRenderedZone), "%s", zone);
+    powerDisplayDirty = false;
   }
 
   lastRenderedUse24Hour = use24Hour;
@@ -188,6 +253,186 @@ void drawClock(bool force = false) {
 bool pingAddress(uint8_t address) {
   Wire.beginTransmission(address);
   return Wire.endTransmission() == 0;
+}
+
+bool readPowerRegister(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(AXP2101_ADDRESS);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(AXP2101_ADDRESS, static_cast<size_t>(1)) != 1) {
+    while (Wire.available()) Wire.read();
+    return false;
+  }
+  value = static_cast<uint8_t>(Wire.read());
+  return true;
+}
+
+bool writePowerRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(AXP2101_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readPowerVoltage(uint8_t highRegister, uint8_t highMask,
+                      uint16_t &millivolts) {
+  uint8_t high = 0;
+  uint8_t low = 0;
+  if (!readPowerRegister(highRegister, high) ||
+      !readPowerRegister(highRegister + 1, low)) {
+    return false;
+  }
+  millivolts = static_cast<uint16_t>((high & highMask) << 8) | low;
+  return true;
+}
+
+const char *chargeStageName(uint8_t stage) {
+  switch (stage) {
+    case 0: return "TRICKLE";
+    case 1: return "PRE-CHARGE";
+    case 2: return "CONSTANT CURRENT";
+    case 3: return "CONSTANT VOLTAGE";
+    case 4: return "CHARGE COMPLETE";
+    case 5: return "NOT CHARGING";
+    default: return "UNKNOWN";
+  }
+}
+
+bool samplePower(PowerSample &sample) {
+  uint8_t status1 = 0;
+  uint8_t status2 = 0;
+  if (!readPowerRegister(AXP2101_STATUS1, status1) ||
+      !readPowerRegister(AXP2101_STATUS2, status2)) {
+    return false;
+  }
+
+  sample.rawStatus1 = status1;
+  sample.rawStatus2 = status2;
+  sample.batteryConnected = (status1 & 0x08) != 0;
+  sample.usbPresent = (status1 & 0x20) != 0 && (status2 & 0x08) == 0;
+  sample.charging = (status2 >> 5) == 0x01;
+  sample.discharging = (status2 >> 5) == 0x02;
+  sample.chargeStage = status2 & 0x07;
+  sample.batteryPercent = -1;
+
+  if (sample.batteryConnected) {
+    if (!readPowerVoltage(AXP2101_BATTERY_VOLTAGE_HIGH, 0x1F,
+                          sample.batteryMillivolts)) {
+      return false;
+    }
+    uint8_t percent = 0;
+    if (readPowerRegister(AXP2101_BATTERY_PERCENT, percent) && percent <= 100) {
+      sample.batteryPercent = percent;
+    }
+  }
+
+  if (sample.usbPresent &&
+      !readPowerVoltage(AXP2101_USB_VOLTAGE_HIGH, 0x3F,
+                        sample.usbMillivolts)) {
+    return false;
+  }
+  if (!readPowerVoltage(AXP2101_SYSTEM_VOLTAGE_HIGH, 0x3F,
+                        sample.systemMillivolts)) {
+    return false;
+  }
+
+  sample.valid = true;
+  return true;
+}
+
+bool initializePowerManager() {
+  uint8_t chipId = 0;
+  if (!readPowerRegister(AXP2101_CHIP_ID, chipId)) {
+    Serial.println("AXP2101: power manager did not respond at I2C 0x34.");
+    return false;
+  }
+  if (chipId != AXP2101_EXPECTED_CHIP_ID) {
+    Serial.printf("AXP2101: unexpected electronic ID 0x%02X.\n", chipId);
+    return false;
+  }
+
+  uint8_t detection = 0;
+  uint8_t adcControl = 0;
+  if (!readPowerRegister(AXP2101_BATTERY_DETECTION, detection) ||
+      !readPowerRegister(AXP2101_ADC_CONTROL, adcControl)) {
+    Serial.println("AXP2101: could not read measurement configuration.");
+    return false;
+  }
+
+  // Only enable sensing. Charging current, charging voltage, and power rails
+  // remain exactly as configured by the board.
+  if (((detection & 0x01) == 0 &&
+       !writePowerRegister(AXP2101_BATTERY_DETECTION, detection | 0x01)) ||
+      ((adcControl & 0x0D) != 0x0D &&
+       !writePowerRegister(AXP2101_ADC_CONTROL, adcControl | 0x0D))) {
+    Serial.println("AXP2101: could not enable battery measurements.");
+    return false;
+  }
+
+  delay(50);
+  Serial.printf("AXP2101 electronic ID: 0x%02X; battery sensing enabled.\n",
+                chipId);
+  return true;
+}
+
+void refreshPowerSample(bool force = false) {
+  if (!powerReady) return;
+  const uint32_t now = millis();
+  if (!force && now - lastPowerSampleMs < POWER_SAMPLE_INTERVAL_MS) return;
+  lastPowerSampleMs = now;
+
+  PowerSample updated{};
+  if (!samplePower(updated)) {
+    Serial.println("AXP2101: battery status read failed.");
+    return;
+  }
+
+  const bool visibleChange =
+      !powerSample.valid ||
+      updated.batteryConnected != powerSample.batteryConnected ||
+      updated.usbPresent != powerSample.usbPresent ||
+      updated.charging != powerSample.charging ||
+      updated.batteryPercent != powerSample.batteryPercent ||
+      updated.batteryMillivolts / 10 != powerSample.batteryMillivolts / 10;
+  powerSample = updated;
+  if (visibleChange) powerDisplayDirty = true;
+}
+
+void printBatteryStatus() {
+  Serial.println();
+  Serial.println("--- BATTERY / POWER ---");
+  if (!powerReady) {
+    Serial.println("AXP2101: NOT AVAILABLE");
+    return;
+  }
+
+  refreshPowerSample(true);
+  if (!powerSample.valid) {
+    Serial.println("AXP2101: telemetry unavailable");
+    return;
+  }
+
+  Serial.println("Power manager: AXP2101 at I2C 0x34");
+  Serial.printf("Battery connected: %s\n",
+                powerSample.batteryConnected ? "YES" : "NO");
+  Serial.printf("USB power present: %s\n", powerSample.usbPresent ? "YES" : "NO");
+  Serial.printf("Charging: %s\n", powerSample.charging ? "YES" : "NO");
+  Serial.printf("Discharging: %s\n", powerSample.discharging ? "YES" : "NO");
+  Serial.printf("Charge stage: %s\n", chargeStageName(powerSample.chargeStage));
+  if (powerSample.batteryConnected) {
+    Serial.printf("Battery voltage: %u mV\n", powerSample.batteryMillivolts);
+    if (powerSample.batteryPercent >= 0) {
+      Serial.printf("Battery level: %d%%\n", powerSample.batteryPercent);
+    } else {
+      Serial.println("Battery level: NOT YET AVAILABLE");
+    }
+  }
+  if (powerSample.usbPresent) {
+    Serial.printf("USB voltage: %u mV\n", powerSample.usbMillivolts);
+  }
+  Serial.printf("System voltage: %u mV\n", powerSample.systemMillivolts);
+  Serial.printf("Raw PMU status: STATUS1=0x%02X STATUS2=0x%02X\n",
+                powerSample.rawStatus1, powerSample.rawStatus2);
 }
 
 bool i2cWrite(const uint8_t *bytes, size_t length) {
@@ -344,6 +589,7 @@ void printStatus() {
   Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
   Serial.printf("Display: %s\n", displayReady ? "CO5300 READY" : "FAILED");
   Serial.printf("Touch: %s\n", touchReady ? "CST9217 READY" : "FAILED");
+  Serial.printf("Power manager: %s\n", powerReady ? "AXP2101 READY" : "FAILED");
   Serial.printf("Clock synchronized: %s\n", clockSynced ? "YES" : "NO");
   Serial.printf("Display mode: %s\n", use24Hour ? "24-hour" : "12-hour");
   if (currentLocalTime(local)) {
@@ -353,12 +599,15 @@ void printStatus() {
   }
   Serial.printf("Flash: %u bytes; PSRAM: %u bytes\n",
                 ESP.getFlashChipSize(), ESP.getPsramSize());
+  printBatteryStatus();
 }
 
 void printHelp() {
   Serial.println();
   Serial.println("Commands:");
   Serial.println("  status - print clock and hardware state");
+  Serial.println("  battery - print battery, USB, and charging information");
+  Serial.println("  power  - same as battery");
   Serial.println("  sync   - reconnect Wi-Fi and repeat NTP synchronization");
   Serial.println("  12     - select 12-hour display");
   Serial.println("  24     - select 24-hour display");
@@ -373,6 +622,8 @@ void processCommand(String command) {
 
   if (command == "status") {
     printStatus();
+  } else if (command == "battery" || command == "power") {
+    printBatteryStatus();
   } else if (command == "sync") {
     syncClock();
   } else if (command == "12") {
@@ -418,6 +669,9 @@ void setup() {
   touchInterruptPending = false;
   attachInterrupt(BoardPins::TOUCH_INT, onTouchInterrupt, FALLING);
 
+  powerReady = initializePowerManager();
+  if (powerReady) refreshPowerSample(true);
+
   drawFaceFrame();
   drawClock(true);
   syncClock();
@@ -428,6 +682,8 @@ void setup() {
 
 void loop() {
   if (Serial.available()) processCommand(Serial.readStringUntil('\n'));
+
+  refreshPowerSample();
 
   if (touchReady && touchInterruptPending) {
     noInterrupts();
