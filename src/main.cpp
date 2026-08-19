@@ -13,7 +13,7 @@
 #endif
 
 namespace {
-constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.4.0";
+constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.5.0";
 constexpr char CENTRAL_TIME_RULE[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 constexpr uint8_t CST9217_ADDRESS = 0x5A;
 constexpr uint8_t CST_ACK = 0xAB;
@@ -33,7 +33,13 @@ constexpr uint32_t WIFI_TIMEOUT_MS = 15000;
 constexpr uint32_t NTP_TIMEOUT_MS = 15000;
 constexpr uint32_t TOUCH_DEBOUNCE_MS = 120;
 constexpr uint32_t TOUCH_REPEAT_MS = 600;
+constexpr uint8_t TOUCH_PROBE_ATTEMPTS = 3;
+constexpr uint8_t TOUCH_READY_POLLS = 8;
+constexpr uint32_t TOUCH_READY_POLL_MS = 75;
 constexpr uint32_t POWER_SAMPLE_INTERVAL_MS = 5000;
+constexpr uint32_t DEFAULT_DISPLAY_TIMEOUT_MS = 30000;
+constexpr uint8_t DEFAULT_DISPLAY_BRIGHTNESS = 128;
+constexpr size_t SERIAL_COMMAND_CAPACITY = 96;
 
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     BoardPins::LCD_CS, BoardPins::LCD_SCLK,
@@ -73,6 +79,7 @@ bool powerReady = false;
 bool clockSynced = false;
 bool use24Hour = false;
 bool powerDisplayDirty = false;
+bool displaySleeping = false;
 volatile bool touchInterruptPending = false;
 uint32_t lastClockSecond = UINT32_MAX;
 int lastRenderedHour = -1;
@@ -82,8 +89,16 @@ bool lastRenderedUse24Hour = false;
 char lastRenderedZone[8]{};
 uint32_t lastAcceptedTouchMs = 0;
 uint32_t lastPowerSampleMs = 0;
+uint32_t lastUserActivityMs = 0;
+uint32_t displayTimeoutMs = DEFAULT_DISPLAY_TIMEOUT_MS;
+uint8_t displayBrightness = DEFAULT_DISPLAY_BRIGHTNESS;
+char serialCommand[SERIAL_COMMAND_CAPACITY]{};
+size_t serialCommandLength = 0;
+bool previousSerialWasCarriageReturn = false;
 TouchSample lastAcceptedTouch{};
 PowerSample powerSample{};
+
+void wakeDisplay(const char *reason);
 
 void IRAM_ATTR onTouchInterrupt() {
   touchInterruptPending = true;
@@ -97,7 +112,7 @@ bool credentialsConfigured() {
 
 void drawCentered(const char *text, int16_t y, uint8_t size, uint16_t color,
                   bool opaque = false) {
-  if (!displayReady) return;
+  if (!displayReady || displaySleeping) return;
   const int16_t width = static_cast<int16_t>(strlen(text) * 6 * size);
   const int16_t centeredX = (BoardPins::LCD_WIDTH - width) / 2;
   display->setTextSize(size);
@@ -112,14 +127,14 @@ void drawCentered(const char *text, int16_t y, uint8_t size, uint16_t color,
 
 void drawStatus(const char *line1, const char *line2 = nullptr,
                 uint16_t color = RGB565_LIGHTGREY) {
-  if (!displayReady) return;
+  if (!displayReady || displaySleeping) return;
   display->fillRect(55, 370, 356, 62, RGB565_BLACK);
   drawCentered(line1, line2 ? 375 : 392, 2, color);
   if (line2) drawCentered(line2, 403, 2, RGB565_LIGHTGREY);
 }
 
 void drawFaceFrame() {
-  if (!displayReady) return;
+  if (!displayReady || displaySleeping) return;
   display->fillScreen(RGB565_BLACK);
   display->drawCircle(233, 233, 221, RGB565_BLUE);
   display->drawCircle(233, 233, 220, RGB565_BLUE);
@@ -137,7 +152,7 @@ bool currentLocalTime(tm &local) {
 }
 
 void drawClock(bool force = false) {
-  if (!displayReady) return;
+  if (!displayReady || displaySleeping) return;
 
   tm local{};
   const bool valid = currentLocalTime(local);
@@ -387,6 +402,8 @@ void refreshPowerSample(bool force = false) {
     return;
   }
 
+  const bool sourceChanged =
+      powerSample.valid && updated.usbPresent != powerSample.usbPresent;
   const bool visibleChange =
       !powerSample.valid ||
       updated.batteryConnected != powerSample.batteryConnected ||
@@ -396,6 +413,58 @@ void refreshPowerSample(bool force = false) {
       updated.batteryMillivolts / 10 != powerSample.batteryMillivolts / 10;
   powerSample = updated;
   if (visibleChange) powerDisplayDirty = true;
+
+  if (sourceChanged) {
+    lastUserActivityMs = now;
+    Serial.printf("POWER SOURCE: %s\n",
+                  powerSample.usbPresent ? "USB" : "BATTERY");
+    if (powerSample.usbPresent && displaySleeping) {
+      wakeDisplay("USB connected");
+    }
+  }
+}
+
+void sleepDisplay(const char *reason) {
+  if (!displayReady || displaySleeping) return;
+  if (!touchReady) {
+    Serial.println("DISPLAY: sleep blocked; touchscreen wake is unavailable.");
+    return;
+  }
+  displaySleeping = true;
+  display->displayOff();
+  Serial.printf("DISPLAY: ASLEEP (%s); touch to wake.\n", reason);
+}
+
+void wakeDisplay(const char *reason) {
+  if (!displayReady) return;
+  lastUserActivityMs = millis();
+  if (!displaySleeping) return;
+
+  display->displayOn();
+  display->setBrightness(displayBrightness);
+  displaySleeping = false;
+  lastClockSecond = UINT32_MAX;
+  lastRenderedHour = -1;
+  lastRenderedMinute = -1;
+  lastRenderedYearDay = -1;
+  lastRenderedZone[0] = '\0';
+  powerDisplayDirty = true;
+  drawFaceFrame();
+  drawClock(true);
+  Serial.printf("DISPLAY: AWAKE (%s).\n", reason);
+}
+
+void updateDisplaySleep() {
+  if (!displayReady || !touchReady || displaySleeping || displayTimeoutMs == 0) {
+    return;
+  }
+  if (!powerReady || !powerSample.valid || !powerSample.batteryConnected ||
+      powerSample.usbPresent) {
+    return;
+  }
+  if (millis() - lastUserActivityMs >= displayTimeoutMs) {
+    sleepDisplay("battery inactivity timeout");
+  }
 }
 
 void printBatteryStatus() {
@@ -467,16 +536,28 @@ void resetTouchController() {
 
 bool probeCst9217() {
   resetTouchController();
-  if (!pingAddress(CST9217_ADDRESS)) return false;
+  bool responding = false;
+  for (uint8_t poll = 0; poll < TOUCH_READY_POLLS && !responding; ++poll) {
+    responding = pingAddress(CST9217_ADDRESS);
+    if (!responding) delay(TOUCH_READY_POLL_MS);
+  }
+  if (!responding) {
+    Serial.println("CST9217: no response at I2C address 0x5A after reset.");
+    return false;
+  }
 
   const uint8_t enterCommandMode[] = {0xD1, 0x01};
-  if (!i2cWrite(enterCommandMode, sizeof(enterCommandMode))) return false;
+  if (!i2cWrite(enterCommandMode, sizeof(enterCommandMode))) {
+    Serial.println("CST9217: could not enter identification mode.");
+    return false;
+  }
   delay(10);
 
   uint8_t chipReply[4]{};
   const uint8_t chipCommand[] = {0xD2, 0x04};
   if (!i2cWriteRead(chipCommand, sizeof(chipCommand),
                     chipReply, sizeof(chipReply))) {
+    Serial.println("CST9217: electronic ID read failed.");
     return false;
   }
 
@@ -486,7 +567,57 @@ bool probeCst9217() {
       static_cast<uint16_t>(chipReply[3] << 8) | chipReply[2];
   Serial.printf("CST92xx electronic ID: chip=0x%04X project=0x%04X\n",
                 chipId, projectId);
-  return chipId == 0x9217 || chipId == 0x9220;
+  if (chipId != 0x9217 && chipId != 0x9220) {
+    Serial.println("CST9217: unexpected electronic ID.");
+    return false;
+  }
+  return true;
+}
+
+bool initializeTouchWithRetries() {
+  for (uint8_t attempt = 1; attempt <= TOUCH_PROBE_ATTEMPTS; ++attempt) {
+    Serial.printf("Touch initialization attempt %u/%u\n",
+                  attempt, TOUCH_PROBE_ATTEMPTS);
+    if (probeCst9217()) {
+      Serial.println("Touch initialization: CST9217 READY.");
+      return true;
+    }
+    if (attempt < TOUCH_PROBE_ATTEMPTS) delay(200);
+  }
+
+  Serial.println("Touch initialization: FAILED; display sleep is blocked.");
+  Serial.println("Use 'touch probe' to retry touchscreen initialization.");
+  return false;
+}
+
+void recoverTouchController() {
+  Serial.println("TOUCH: recovering CST9217 and its shared display reset.");
+  detachInterrupt(BoardPins::TOUCH_INT);
+  touchInterruptPending = false;
+  touchReady = initializeTouchWithRetries();
+
+  // The touch-controller reset also resets CO5300, so always restore its face.
+  displayReady = display->begin();
+  displaySleeping = false;
+  Serial.printf("CO5300 display recovery: %s\n",
+                displayReady ? "SUCCESS" : "FAILED");
+  if (displayReady) display->setBrightness(displayBrightness);
+  delay(250);
+
+  if (touchReady) {
+    attachInterrupt(BoardPins::TOUCH_INT, onTouchInterrupt, FALLING);
+  }
+  touchInterruptPending = false;
+  lastUserActivityMs = millis();
+  lastClockSecond = UINT32_MAX;
+  lastRenderedHour = -1;
+  lastRenderedMinute = -1;
+  lastRenderedYearDay = -1;
+  lastRenderedZone[0] = '\0';
+  powerDisplayDirty = true;
+  drawFaceFrame();
+  drawClock(true);
+  Serial.printf("TOUCH: %s\n", touchReady ? "CST9217 READY" : "FAILED");
 }
 
 bool readTouch(TouchSample &sample) {
@@ -588,6 +719,17 @@ void printStatus() {
   Serial.println();
   Serial.printf("Firmware: %s\n", FIRMWARE_VERSION);
   Serial.printf("Display: %s\n", displayReady ? "CO5300 READY" : "FAILED");
+  Serial.printf("Screen state: %s\n", displaySleeping ? "ASLEEP" : "AWAKE");
+  Serial.printf("Screen brightness: %u / 255\n", displayBrightness);
+  if (displayTimeoutMs == 0) {
+    Serial.println("Battery screen timeout: DISABLED");
+  } else if (!touchReady) {
+    Serial.printf("Battery screen timeout: BLOCKED (touch unavailable; %lu seconds configured)\n",
+                  static_cast<unsigned long>(displayTimeoutMs / 1000));
+  } else {
+    Serial.printf("Battery screen timeout: %lu seconds\n",
+                  static_cast<unsigned long>(displayTimeoutMs / 1000));
+  }
   Serial.printf("Touch: %s\n", touchReady ? "CST9217 READY" : "FAILED");
   Serial.printf("Power manager: %s\n", powerReady ? "AXP2101 READY" : "FAILED");
   Serial.printf("Clock synchronized: %s\n", clockSynced ? "YES" : "NO");
@@ -608,11 +750,20 @@ void printHelp() {
   Serial.println("  status - print clock and hardware state");
   Serial.println("  battery - print battery, USB, and charging information");
   Serial.println("  power  - same as battery");
+  Serial.println("  sleep  - switch the AMOLED display off now");
+  Serial.println("  wake   - wake the AMOLED display");
+  Serial.println("  touch  - show touchscreen availability");
+  Serial.println("  touch probe - retry touchscreen initialization");
+  Serial.println("  timeout - show the battery-only screen timeout");
+  Serial.println("  timeout N - set battery-only timeout to 5-3600 seconds");
+  Serial.println("  timeout off - disable automatic display sleep");
+  Serial.println("  brightness N - set screen brightness from 1 to 255");
   Serial.println("  sync   - reconnect Wi-Fi and repeat NTP synchronization");
   Serial.println("  12     - select 12-hour display");
   Serial.println("  24     - select 24-hour display");
   Serial.println("  help   - show this list");
-  Serial.println("A deliberate screen tap toggles 12/24-hour display.");
+  Serial.println("A sleeping screen wakes on the first tap without changing mode.");
+  Serial.println("An awake screen toggles 12/24-hour on a deliberate tap.");
 }
 
 void processCommand(String command) {
@@ -624,6 +775,49 @@ void processCommand(String command) {
     printStatus();
   } else if (command == "battery" || command == "power") {
     printBatteryStatus();
+  } else if (command == "sleep") {
+    sleepDisplay("serial command");
+  } else if (command == "wake") {
+    wakeDisplay("serial command");
+  } else if (command == "touch") {
+    Serial.printf("Touch: %s\n", touchReady ? "CST9217 READY" : "FAILED");
+    if (!touchReady) {
+      Serial.println("Type 'touch probe' to retry touchscreen initialization.");
+    }
+  } else if (command == "touch probe") {
+    recoverTouchController();
+  } else if (command == "timeout") {
+    if (displayTimeoutMs == 0) {
+      Serial.println("Automatic battery screen sleep: DISABLED");
+    } else {
+      Serial.printf("Automatic battery screen sleep: %lu seconds\n",
+                    static_cast<unsigned long>(displayTimeoutMs / 1000));
+    }
+  } else if (command == "timeout off") {
+    displayTimeoutMs = 0;
+    Serial.println("Automatic battery screen sleep disabled.");
+  } else if (command.startsWith("timeout ")) {
+    const long seconds = command.substring(8).toInt();
+    if (seconds < 5 || seconds > 3600) {
+      Serial.println("Timeout must be between 5 and 3600 seconds.");
+    } else {
+      displayTimeoutMs = static_cast<uint32_t>(seconds) * 1000;
+      lastUserActivityMs = millis();
+      Serial.printf("Automatic battery screen sleep set to %ld seconds.\n",
+                    seconds);
+    }
+  } else if (command.startsWith("brightness ")) {
+    const long requested = command.substring(11).toInt();
+    if (requested < 1 || requested > 255) {
+      Serial.println("Brightness must be between 1 and 255.");
+    } else {
+      displayBrightness = static_cast<uint8_t>(requested);
+      if (displayReady && !displaySleeping) {
+        display->setBrightness(displayBrightness);
+      }
+      lastUserActivityMs = millis();
+      Serial.printf("Screen brightness set to %u / 255.\n", displayBrightness);
+    }
   } else if (command == "sync") {
     syncClock();
   } else if (command == "12") {
@@ -642,6 +836,43 @@ void processCommand(String command) {
   }
   Serial.print("> ");
 }
+
+void processSerialInput() {
+  while (Serial.available()) {
+    const char incoming = static_cast<char>(Serial.read());
+    if (incoming == '\r' || incoming == '\n') {
+      if (incoming == '\n' && previousSerialWasCarriageReturn) {
+        previousSerialWasCarriageReturn = false;
+        continue;
+      }
+      previousSerialWasCarriageReturn = incoming == '\r';
+      Serial.println();
+      if (serialCommandLength == 0) {
+        Serial.print("> ");
+        continue;
+      }
+      serialCommand[serialCommandLength] = '\0';
+      processCommand(String(serialCommand));
+      serialCommandLength = 0;
+      continue;
+    }
+
+    previousSerialWasCarriageReturn = false;
+    if (incoming == '\b' || incoming == 0x7F) {
+      if (serialCommandLength > 0) {
+        --serialCommandLength;
+        Serial.print("\b \b");
+      }
+      continue;
+    }
+
+    if (incoming >= 32 && incoming <= 126 &&
+        serialCommandLength + 1 < SERIAL_COMMAND_CAPACITY) {
+      serialCommand[serialCommandLength++] = incoming;
+      Serial.write(static_cast<uint8_t>(incoming));
+    }
+  }
+}
 }  // namespace
 
 void setup() {
@@ -658,16 +889,18 @@ void setup() {
   Wire.begin(BoardPins::I2C_SDA, BoardPins::I2C_SCL, 400000);
 
   // Touch is probed first because its reset is shared with the AMOLED reset.
-  touchReady = probeCst9217();
+  touchReady = initializeTouchWithRetries();
   displayReady = display->begin();
   Serial.printf("CO5300 display initialization: %s\n",
                 displayReady ? "SUCCESS" : "FAILED");
-  if (displayReady) display->setBrightness(128);
+  if (displayReady) display->setBrightness(displayBrightness);
 
   // Display initialization resets CST9217 again through the shared reset line.
-  delay(200);
+  delay(250);
   touchInterruptPending = false;
-  attachInterrupt(BoardPins::TOUCH_INT, onTouchInterrupt, FALLING);
+  if (touchReady) {
+    attachInterrupt(BoardPins::TOUCH_INT, onTouchInterrupt, FALLING);
+  }
 
   powerReady = initializePowerManager();
   if (powerReady) refreshPowerSample(true);
@@ -677,11 +910,12 @@ void setup() {
   syncClock();
   printStatus();
   printHelp();
+  lastUserActivityMs = millis();
   Serial.print("> ");
 }
 
 void loop() {
-  if (Serial.available()) processCommand(Serial.readStringUntil('\n'));
+  processSerialInput();
 
   refreshPowerSample();
 
@@ -699,15 +933,23 @@ void loop() {
 
     // Empty CST9217 IRQ packets are normal and intentionally remain silent.
     if (pointAvailable && acceptTouch(sample)) {
-      use24Hour = !use24Hour;
-      Serial.printf("TOUCH X=%u Y=%u; display changed to %s\n",
-                    sample.screenX, sample.screenY,
-                    use24Hour ? "24-hour" : "12-hour");
-      lastClockSecond = UINT32_MAX;
-      drawClock(true);
+      lastUserActivityMs = millis();
+      if (displaySleeping) {
+        Serial.printf("TOUCH X=%u Y=%u; waking display.\n",
+                      sample.screenX, sample.screenY);
+        wakeDisplay("touch");
+      } else {
+        use24Hour = !use24Hour;
+        Serial.printf("TOUCH X=%u Y=%u; display changed to %s\n",
+                      sample.screenX, sample.screenY,
+                      use24Hour ? "24-hour" : "12-hour");
+        lastClockSecond = UINT32_MAX;
+        drawClock(true);
+      }
     }
   }
 
+  updateDisplaySleep();
   drawClock();
   delay(2);
 }
