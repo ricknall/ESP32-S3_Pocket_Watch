@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Arduino_GFX_Library.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
@@ -1994,7 +1995,7 @@ const GFXfont OrangeSmall18 PROGMEM = {
 };
 
 namespace {
-constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.8.3";
+constexpr char FIRMWARE_VERSION[] = "Pocket Watch Clock 0.8.4";
 constexpr char CENTRAL_TIME_RULE[] = "CST6CDT,M3.2.0/2,M11.1.0/2";
 constexpr char WATCH_LOCATION[] = "OCEAN SPRINGS";
 constexpr double WATCH_LATITUDE = 30.4113;
@@ -2003,7 +2004,15 @@ constexpr double DEGREES_TO_RADIANS = 0.017453292519943295;
 constexpr double OFFICIAL_ZENITH_DEGREES = 90.833;
 constexpr uint16_t FACE_ORANGE = 0xFBC0;
 constexpr char NOAA_TIDE_STATION[] = "8743281";
-constexpr size_t MAX_TIDE_EVENTS = 12;
+constexpr char TIDE_PREFERENCES_NAMESPACE[] = "watch-tides";
+constexpr uint8_t TIDE_CACHE_VERSION = 1;
+constexpr size_t MAX_TIDE_EVENTS = 20;
+constexpr uint16_t TIDE_REQUEST_RANGE_HOURS = 168;
+constexpr uint32_t TIDE_HTTP_TIMEOUT_MS = 20000;
+constexpr uint32_t TIDE_REFRESH_INTERVAL_SECONDS = 12UL * 60UL * 60UL;
+constexpr uint32_t TIDE_RETRY_BASE_SECONDS = 15UL * 60UL;
+constexpr uint32_t TIDE_RETRY_MAX_SECONDS = 6UL * 60UL * 60UL;
+constexpr size_t TIDE_ERROR_CAPACITY = 160;
 constexpr uint8_t CST9217_ADDRESS = 0x5A;
 constexpr uint8_t CST_ACK = 0xAB;
 constexpr uint8_t AXP2101_ADDRESS = 0x34;
@@ -2087,6 +2096,13 @@ bool lockButtonPressed = false;
 bool lockButtonHandled = false;
 TideEvent tideEvents[MAX_TIDE_EVENTS]{};
 size_t tideEventCount = 0;
+time_t lastSuccessfulTideFetch = 0;
+time_t nextTideAttempt = 0;
+uint32_t nextTideAttemptMs = 0;
+bool tideAttemptScheduled = false;
+uint8_t tideConsecutiveFailures = 0;
+int lastTideResponseCode = 0;
+char lastTideError[TIDE_ERROR_CAPACITY]{};
 bool processorSleepEnabled = true;
 bool processorSleepHealthy = true;
 volatile bool touchInterruptPending = false;
@@ -3095,6 +3111,103 @@ bool parseNoaaLocalTime(const String &text, time_t &when) {
   return when > 0;
 }
 
+void printTidePayloadExcerpt(const String &payload) {
+  String excerpt = payload.substring(0, 240);
+  excerpt.replace('\r', ' ');
+  excerpt.replace('\n', ' ');
+  Serial.printf("TIDES: NOAA response excerpt: %s\n", excerpt.c_str());
+}
+
+void scheduleTideAttempt(bool success) {
+  const time_t now = time(nullptr);
+  uint32_t delaySeconds = 0;
+  if (success) {
+    tideConsecutiveFailures = 0;
+    delaySeconds = TIDE_REFRESH_INTERVAL_SECONDS;
+  } else {
+    if (tideConsecutiveFailures < UINT8_MAX) ++tideConsecutiveFailures;
+    delaySeconds = TIDE_RETRY_BASE_SECONDS;
+    for (uint8_t failure = 1;
+         failure < tideConsecutiveFailures &&
+         delaySeconds < TIDE_RETRY_MAX_SECONDS;
+         ++failure) {
+      delaySeconds *= 2;
+    }
+    if (delaySeconds > TIDE_RETRY_MAX_SECONDS) {
+      delaySeconds = TIDE_RETRY_MAX_SECONDS;
+    }
+  }
+
+  nextTideAttempt = now >= 1700000000 ? now + delaySeconds : 0;
+  nextTideAttemptMs = millis() + delaySeconds * 1000UL;
+  tideAttemptScheduled = true;
+  if (!success) {
+    Serial.printf("TIDES: automatic retry scheduled in %lu minutes.\n",
+                  static_cast<unsigned long>(delaySeconds / 60));
+  }
+}
+
+bool saveTideCache() {
+  if (!tideEventCount || tideEventCount > MAX_TIDE_EVENTS) return false;
+
+  Preferences preferences;
+  if (!preferences.begin(TIDE_PREFERENCES_NAMESPACE, false)) {
+    Serial.println("TIDES: unable to open persistent cache for writing.");
+    return false;
+  }
+
+  const size_t dataSize = tideEventCount * sizeof(TideEvent);
+  const bool saved =
+      preferences.putUChar("version", TIDE_CACHE_VERSION) == sizeof(uint8_t) &&
+      preferences.putUChar("count", static_cast<uint8_t>(tideEventCount)) ==
+          sizeof(uint8_t) &&
+      preferences.putBytes("events", tideEvents, dataSize) == dataSize &&
+      preferences.putLong64("fetched", lastSuccessfulTideFetch) ==
+          sizeof(int64_t);
+  preferences.end();
+
+  Serial.printf("TIDES: persistent cache %s.\n", saved ? "saved" : "failed");
+  return saved;
+}
+
+bool loadTideCache() {
+  Preferences preferences;
+  if (!preferences.begin(TIDE_PREFERENCES_NAMESPACE, false)) return false;
+
+  const uint8_t version = preferences.getUChar("version", 0);
+  const uint8_t count = preferences.getUChar("count", 0);
+  const size_t expectedSize = static_cast<size_t>(count) * sizeof(TideEvent);
+  if (version != TIDE_CACHE_VERSION || count == 0 ||
+      count > MAX_TIDE_EVENTS ||
+      preferences.getBytesLength("events") != expectedSize) {
+    preferences.end();
+    return false;
+  }
+
+  TideEvent cached[MAX_TIDE_EVENTS]{};
+  const size_t loaded = preferences.getBytes("events", cached, expectedSize);
+  const time_t fetched = static_cast<time_t>(
+      preferences.getLong64("fetched", 0));
+  preferences.end();
+  if (loaded != expectedSize) return false;
+
+  for (size_t index = 0; index < count; ++index) {
+    if (cached[index].when < 1700000000 ||
+        (cached[index].type != 'H' && cached[index].type != 'L') ||
+        (index > 0 && cached[index].when <= cached[index - 1].when)) {
+      Serial.println("TIDES: persistent cache failed validation.");
+      return false;
+    }
+  }
+
+  memcpy(tideEvents, cached, expectedSize);
+  tideEventCount = count;
+  lastSuccessfulTideFetch = fetched;
+  Serial.printf("TIDES: restored %u events from persistent cache.\n",
+                static_cast<unsigned>(tideEventCount));
+  return true;
+}
+
 bool fetchTidePredictions() {
   tm local{};
   if (!currentLocalTime(local)) {
@@ -3107,22 +3220,42 @@ bool fetchTidePredictions() {
       "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
       "?product=predictions&application=PocketWatch&begin_date=";
   url += beginDate;
-  url += "&range=72&datum=MLLW&station=";
+  url += "&range=";
+  url += String(TIDE_REQUEST_RANGE_HOURS);
+  url += "&datum=MLLW&station=";
   url += NOAA_TIDE_STATION;
   url += "&time_zone=lst_ldt&units=english&interval=hilo&format=json";
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(10000);
+  http.setTimeout(TIDE_HTTP_TIMEOUT_MS);
   if (!http.begin(client, url)) {
     Serial.println("TIDES: unable to start NOAA request.");
+    snprintf(lastTideError, sizeof(lastTideError),
+             "Unable to start NOAA request");
+    lastTideResponseCode = 0;
+    scheduleTideAttempt(false);
     return false;
   }
   const int responseCode = http.GET();
+  lastTideResponseCode = responseCode;
   if (responseCode != HTTP_CODE_OK) {
-    Serial.printf("TIDES: NOAA request failed (%d).\n", responseCode);
+    const String payload = responseCode > 0 ? http.getString() : String();
     http.end();
+    if (responseCode < 0) {
+      const String error = HTTPClient::errorToString(responseCode);
+      Serial.printf("TIDES: NOAA transport failed (%d: %s).\n",
+                    responseCode, error.c_str());
+      snprintf(lastTideError, sizeof(lastTideError),
+               "Transport %d: %s", responseCode, error.c_str());
+    } else {
+      Serial.printf("TIDES: NOAA returned HTTP %d.\n", responseCode);
+      snprintf(lastTideError, sizeof(lastTideError),
+               "NOAA HTTP %d", responseCode);
+      if (payload.length()) printTidePayloadExcerpt(payload);
+    }
+    scheduleTideAttempt(false);
     return false;
   }
   const String payload = http.getString();
@@ -3151,13 +3284,28 @@ bool fetchTidePredictions() {
   }
   if (!parsedCount) {
     Serial.println("TIDES: NOAA response contained no high/low events.");
+    String message;
+    if (jsonStringField(payload, "message", message)) {
+      Serial.printf("TIDES: NOAA message: %s\n", message.c_str());
+      snprintf(lastTideError, sizeof(lastTideError),
+               "NOAA: %s", message.c_str());
+    } else {
+      snprintf(lastTideError, sizeof(lastTideError),
+               "NOAA response contained no high/low events");
+      printTidePayloadExcerpt(payload);
+    }
+    scheduleTideAttempt(false);
     return false;
   }
 
   memcpy(tideEvents, parsed, parsedCount * sizeof(TideEvent));
   tideEventCount = parsedCount;
+  lastSuccessfulTideFetch = time(nullptr);
+  lastTideError[0] = '\0';
   Serial.printf("TIDES: cached %u events for NOAA station %s.\n",
                 static_cast<unsigned>(tideEventCount), NOAA_TIDE_STATION);
+  saveTideCache();
+  scheduleTideAttempt(true);
   return true;
 }
 
@@ -3182,6 +3330,10 @@ bool syncClock() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi connection timed out.");
+    snprintf(lastTideError, sizeof(lastTideError),
+             "Wi-Fi connection timed out before tide request");
+    lastTideResponseCode = 0;
+    scheduleTideAttempt(false);
     stopWiFi();
     drawClock(true);
     drawStatus("WI-FI FAILED", "SERIAL: sync TO RETRY", RGB565_RED);
@@ -3211,10 +3363,78 @@ bool syncClock() {
     drawClock(true);
   } else {
     Serial.println("NTP synchronization timed out.");
+    snprintf(lastTideError, sizeof(lastTideError),
+             "Clock unavailable before tide request");
+    lastTideResponseCode = 0;
+    scheduleTideAttempt(false);
     drawClock(true);
     drawStatus("NTP FAILED", "SERIAL: sync TO RETRY", RGB565_RED);
   }
   return clockSynced;
+}
+
+void serviceTideRefresh() {
+  if (!tideAttemptScheduled ||
+      static_cast<int32_t>(millis() - nextTideAttemptMs) < 0) {
+    return;
+  }
+
+  // Clear first so a failed connection cannot immediately retrigger in loop().
+  tideAttemptScheduled = false;
+  nextTideAttempt = 0;
+  nextTideAttemptMs = 0;
+  Serial.println("TIDES: scheduled refresh starting.");
+  syncClock();
+}
+
+void printTideTime(const char *label, time_t value) {
+  if (value <= 0) {
+    Serial.printf("%s: NEVER\n", label);
+    return;
+  }
+  tm local{};
+  char timestamp[32]{};
+  localtime_r(&value, &local);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M %Z", &local);
+  Serial.printf("%s: %s\n", label, timestamp);
+}
+
+void printTideStatus() {
+  Serial.println();
+  Serial.println("--- TIDES ---");
+  Serial.printf("NOAA station: %s (Ocean Springs)\n", NOAA_TIDE_STATION);
+  Serial.printf("Cached events: %u\n",
+                static_cast<unsigned>(tideEventCount));
+  printTideTime("Last successful tide fetch", lastSuccessfulTideFetch);
+  if (nextTideAttempt > 0) {
+    printTideTime("Next automatic tide attempt", nextTideAttempt);
+  } else if (tideAttemptScheduled) {
+    const uint32_t remainingMs = nextTideAttemptMs - millis();
+    Serial.printf("Next automatic tide attempt: in about %lu minutes\n",
+                  static_cast<unsigned long>((remainingMs + 59999UL) / 60000UL));
+  } else {
+    Serial.println("Next automatic tide attempt: NOT SCHEDULED");
+  }
+  Serial.printf("Consecutive tide failures: %u\n", tideConsecutiveFailures);
+  if (lastTideResponseCode != 0) {
+    Serial.printf("Last NOAA response code: %d\n", lastTideResponseCode);
+  }
+  if (lastTideError[0]) {
+    Serial.printf("Last tide error: %s\n", lastTideError);
+  }
+
+  const time_t now = time(nullptr);
+  size_t futureCount = 0;
+  for (size_t index = 0; index < tideEventCount; ++index) {
+    if (tideEvents[index].when < now) continue;
+    tm local{};
+    char timestamp[32]{};
+    localtime_r(&tideEvents[index].when, &local);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M %Z", &local);
+    Serial.printf("  %c  %s\n", tideEvents[index].type, timestamp);
+    if (++futureCount >= 6) break;
+  }
+  if (!futureCount) Serial.println("Future cached events: NONE");
 }
 
 void printStatus() {
@@ -3280,6 +3500,7 @@ void printStatus() {
   }
   Serial.printf("Flash: %u bytes; PSRAM: %u bytes\n",
                 ESP.getFlashChipSize(), ESP.getPsramSize());
+  printTideStatus();
   printBatteryStatus();
 }
 
@@ -3300,6 +3521,8 @@ void printHelp() {
   Serial.println("  timeout off - disable automatic display sleep");
   Serial.println("  brightness N - set screen brightness from 1 to 255");
   Serial.println("  sync   - reconnect Wi-Fi and repeat NTP synchronization");
+  Serial.println("  tides  - print tide cache and NOAA request state");
+  Serial.println("  tides refresh - reconnect Wi-Fi and refresh tides now");
   Serial.println("  help   - show this list");
   Serial.println("On battery, the processor light-sleeps when the screen is off.");
   Serial.println("Touch wakes a sleeping screen; touches while awake are ignored.");
@@ -3376,6 +3599,10 @@ void processCommand(String command) {
       Serial.printf("Screen brightness set to %u / 255.\n", displayBrightness);
     }
   } else if (command == "sync") {
+    syncClock();
+  } else if (command == "tides") {
+    printTideStatus();
+  } else if (command == "tides refresh") {
     syncClock();
   } else if (command == "12") {
     Serial.println("12-hour mode has been removed; display remains 24-hour.");
@@ -3457,6 +3684,10 @@ void setup() {
   Serial.println("Central Time: automatic CST/CDT");
   Serial.println("========================================");
 
+  setenv("TZ", CENTRAL_TIME_RULE, 1);
+  tzset();
+  loadTideCache();
+
   Wire.begin(BoardPins::I2C_SDA, BoardPins::I2C_SCL, 400000);
 
   // Touch is probed first because its reset is shared with the AMOLED reset.
@@ -3493,6 +3724,7 @@ void loop() {
   updateDisplayLockButton();
 
   refreshPowerSample();
+  serviceTideRefresh();
 
   if (touchReady && touchInterruptPending) {
     noInterrupts();
